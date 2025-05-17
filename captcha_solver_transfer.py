@@ -72,10 +72,11 @@ class Captcha(object):
         # Add custom classification head
         x = base_model.output
         x = GlobalAveragePooling2D()(x) # Global Average Pooling reduces spatial dimensions
-        # Optional: Add an intermediate dense layer if needed, but for small data, simpler is often better
-        # x = Dense(128, activation='relu')(x)
-        # x = BatchNormalization()(x) # Good to use with Dense layers
-        # x = Dropout(0.5)(x) # Helps prevent overfitting
+        # Simpler head for potentially better generalization with small data
+        x = Dense(128, activation='relu')(x)
+        x = BatchNormalization()(x) # Good to use with Dense layers
+        x = Dropout(0.5)(x) # Helps prevent overfitting
+        
         output_tensor = Dense(NUM_CLASSES, activation='softmax')(x) # Output layer for our characters
 
         model = Model(inputs=input_tensor, outputs=output_tensor)
@@ -171,9 +172,46 @@ class Captcha(object):
             return np.array([]), np.array([])
         return np.array(char_images_data), np.array(char_labels_data)
 
+    def _augment_batch(self, images):
+        """Apply random augmentations to a batch of images"""
+        augmented = []
+        
+        # Initialize augmentation layers once
+        rotation = tf.keras.layers.RandomRotation(factor=0.1)  # ±10 degrees = ±0.1 radians
+        translation = tf.keras.layers.RandomTranslation(height_factor=0.1, width_factor=0.1)
+        zoom = tf.keras.layers.RandomZoom(height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1))
+        
+        for image in images:
+            # Convert to tensor and add batch dimension
+            img = tf.convert_to_tensor(image)
+            img = tf.cast(img, tf.float32)
+            img = tf.expand_dims(img, 0)  # Add batch dimension
+            
+            # Random rotation
+            if tf.random.uniform([]) > 0.5:
+                img = rotation(img)
+            
+            # Random translation
+            if tf.random.uniform([]) > 0.5:
+                img = translation(img)
+            
+            # Random zoom
+            if tf.random.uniform([]) > 0.5:
+                img = zoom(img)
+            
+            # Random brightness
+            if tf.random.uniform([]) > 0.5:
+                img = tf.image.random_brightness(img, 0.2)
+            
+            # Remove batch dimension and ensure values are in valid range
+            img = tf.squeeze(img, axis=0)
+            img = tf.clip_by_value(img, -1.0, 1.0)  # For MobileNetV2 preprocessed inputs
+            augmented.append(img.numpy())
+            
+        return np.array(augmented)
 
-    def train(self, X_train, y_train, X_val, y_val, epochs=30, batch_size=8):
-        """Trains the model (only the new head if base_model.trainable=False)."""
+    def train(self, X_train, y_train, X_val, y_val, epochs=50, batch_size=16):
+        """Trains the model with custom data augmentation."""
         if self.model is None:
             print("Error: Model not built (TensorFlow might be missing or failed to initialize). Cannot train.")
             return None
@@ -185,18 +223,132 @@ class Captcha(object):
         y_train_cat = to_categorical(y_train, num_classes=NUM_CLASSES)
         y_val_cat = to_categorical(y_val, num_classes=NUM_CLASSES)
 
-        # Callbacks for better training
-        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1)
-        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001, verbose=1)
-
         print(f"Starting training with {len(X_train)} training character samples and {len(X_val)} validation character samples.")
-        history = self.model.fit(
-            X_train, y_train_cat,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_data=(X_val, y_val_cat),
-            callbacks=[early_stopping, reduce_lr]
-        )
+        
+        # Custom training loop with data augmentation
+        steps_per_epoch = max(len(X_train) * 4 // batch_size, 1)  # 4x augmentation
+        
+        # Initialize variables for early stopping and learning rate reduction
+        best_val_loss = float('inf')
+        patience = 15
+        min_delta = 0.001
+        wait = 0
+        
+        # Learning rate reduction parameters
+        lr_patience = 7
+        lr_wait = 0
+        lr_factor = 0.5
+        min_lr = 0.00001
+        
+        # Define the training step function with tf.function and input signatures
+        @tf.function(reduce_retracing=True,
+                    input_signature=[
+                        tf.TensorSpec(shape=(None, CHAR_IMG_HEIGHT, CHAR_IMG_WIDTH, 3), dtype=tf.float32),
+                        tf.TensorSpec(shape=(None, NUM_CLASSES), dtype=tf.float32)
+                    ])
+        def train_step(x, y):
+            with tf.GradientTape() as tape:
+                predictions = self.model(x, training=True)
+                loss = tf.keras.losses.categorical_crossentropy(y, predictions)
+            gradients = tape.gradient(loss, self.model.trainable_variables)
+            self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+            return loss, predictions
+
+        # Training history
+        history = {
+            'loss': [],
+            'accuracy': [],
+            'val_loss': [],
+            'val_accuracy': []
+        }
+        
+        for epoch in range(epochs):
+            # Shuffle indices for this epoch
+            indices = np.random.permutation(len(X_train))
+            epoch_loss = []
+            epoch_accuracy = []
+            
+            for step in range(steps_per_epoch):
+                # Get batch indices with wrapping
+                start_idx = (step * batch_size) % len(X_train)
+                end_idx = min(start_idx + batch_size, len(X_train))
+                if end_idx - start_idx < batch_size:  # Wrap around
+                    batch_indices = np.concatenate([
+                        indices[start_idx:end_idx],
+                        indices[:batch_size - (end_idx - start_idx)]
+                    ])
+                else:
+                    batch_indices = indices[start_idx:end_idx]
+                
+                # Get batch data
+                batch_x = X_train[batch_indices]
+                batch_y = y_train_cat[batch_indices]
+                
+                # Apply augmentation
+                batch_x = self._augment_batch(batch_x)
+                
+                # Convert to tensors with explicit shapes
+                batch_x = tf.convert_to_tensor(batch_x, dtype=tf.float32)
+                batch_x = tf.ensure_shape(batch_x, [None, CHAR_IMG_HEIGHT, CHAR_IMG_WIDTH, 3])
+                batch_y = tf.convert_to_tensor(batch_y, dtype=tf.float32)
+                batch_y = tf.ensure_shape(batch_y, [None, NUM_CLASSES])
+                
+                # Train step
+                loss, predictions = train_step(batch_x, batch_y)
+                epoch_loss.append(loss.numpy())
+                epoch_accuracy.append(tf.reduce_mean(tf.keras.metrics.categorical_accuracy(batch_y, predictions)).numpy())
+            
+            # Calculate average metrics for this epoch
+            avg_loss = np.mean(epoch_loss)
+            avg_accuracy = np.mean(epoch_accuracy)
+            
+            # Evaluate on validation set
+            val_metrics = self.model.evaluate(X_val, y_val_cat, verbose=0)
+            val_loss = val_metrics[0]
+            val_accuracy = val_metrics[1]
+            
+            # Store metrics in history
+            history['loss'].append(avg_loss)
+            history['accuracy'].append(avg_accuracy)
+            history['val_loss'].append(val_loss)
+            history['val_accuracy'].append(val_accuracy)
+            
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            print(f"loss: {avg_loss:.4f} - accuracy: {avg_accuracy:.4f} - val_loss: {val_loss:.4f} - val_accuracy: {val_accuracy:.4f}")
+            
+            # Early stopping check
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                wait = 0
+                # Save best weights
+                self.model.save_weights('best_model.weights.h5')
+            else:
+                wait += 1
+                if wait >= patience:
+                    print(f"Early stopping triggered after {epoch + 1} epochs")
+                    # Restore best weights
+                    self.model.load_weights('best_model.weights.h5')
+                    break
+            
+            # Learning rate reduction
+            if val_loss < best_val_loss - min_delta:
+                lr_wait = 0
+            else:
+                lr_wait += 1
+                if lr_wait >= lr_patience:
+                    # Get current learning rate
+                    current_lr = self.model.optimizer.learning_rate
+                    if isinstance(current_lr, tf.Variable):
+                        current_lr = current_lr.numpy()
+                    current_lr = float(current_lr)
+                    
+                    if current_lr > min_lr:
+                        new_lr = max(current_lr * lr_factor, min_lr)
+                        # Update learning rate using assign
+                        self.model.optimizer.learning_rate.assign(new_lr)
+                        print(f"Reducing learning rate to {new_lr}")
+                        lr_wait = 0
+        
         print("Training complete.")
         return history
 
@@ -322,118 +474,85 @@ if __name__ == '__main__':
         else:
             print(f"Discovered {len(all_samples_data)} valid CAPTCHA samples to process.")
 
-            # --- 3. Instantiate the Captcha solver ---
+            # --- 3. Split samples into train, validation, and test sets ---
+            # Split samples before extracting characters (60% train, 20% validation, 20% test)
+            train_samples, temp_val_test = train_test_split(all_samples_data, test_size=0.4, random_state=42)
+            val_samples, test_samples = train_test_split(temp_val_test, test_size=0.5, random_state=42)
+
+            print(f"\nSplit samples into:")
+            print(f"Training samples: {len(train_samples)}")
+            print(f"Validation samples: {len(val_samples)}")
+            print(f"Test samples: {len(test_samples)}")
+
+            # --- 4. Instantiate the Captcha solver ---
             captcha_solver = Captcha()
 
-            if captcha_solver.model is None: # Check if model building failed (e.g., TF not available)
-                 print("Exiting: Captcha model could not be initialized.")
+            if captcha_solver.model is None:
+                print("Exiting: Captcha model could not be initialized.")
             else:
-                # --- 4. Load and prepare all character data from the discovered CAPTCHAs ---
-                print("Loading and preparing character data from all samples...")
-                X_all_chars, y_all_chars = captcha_solver.load_and_prepare_data_from_samples(all_samples_data)
+                # --- 5. Load and prepare character data from training and validation samples ---
+                print("\nLoading and preparing character data from training samples...")
+                X_train_chars, y_train_chars = captcha_solver.load_and_prepare_data_from_samples(train_samples)
                 
-                if X_all_chars.size == 0 or y_all_chars.size == 0:
-                    print("CRITICAL: No character data was loaded from the samples. This might be due to issues opening images, segmenting characters, or invalid labels. Please check warnings above. Exiting.")
+                print("Loading and preparing character data from validation samples...")
+                X_val_chars, y_val_chars = captcha_solver.load_and_prepare_data_from_samples(val_samples)
+                
+                if X_train_chars.size == 0 or y_train_chars.size == 0:
+                    print("CRITICAL: No character data was loaded from training samples. Exiting.")
                 else:
-                    print(f"Successfully loaded {len(X_all_chars)} individual character images and {len(y_all_chars)} corresponding labels.")
-
-                    # --- 5. Split character data into training, validation, and test sets ---
-                    # Simple split: 60% train, 20% validation, 20% test
-                    # First split: 60% train, 40% remaining
-                    X_train_chars, X_temp_val_test, y_train_chars, y_temp_val_test = train_test_split(
-                        X_all_chars, y_all_chars, test_size=0.4, random_state=42
-                    )
-                    
-                    # Second split: Split the remaining 40% into equal validation and test sets
-                    X_val_chars, X_test_chars, y_val_chars, y_test_chars = train_test_split(
-                        X_temp_val_test, y_temp_val_test, test_size=0.5, random_state=42
-                    )
-
+                    print(f"\nPrepared data statistics:")
                     print(f"Training characters: {len(X_train_chars)}")
                     print(f"Validation characters: {len(X_val_chars)}")
-                    print(f"Test characters: {len(X_test_chars)}")
 
                     # --- 6. Train the model ---
                     if len(X_train_chars) > 0 and len(X_val_chars) > 0:
-                        print("Starting model training...")
-                        captcha_solver.train(X_train_chars, y_train_chars, X_val_chars, y_val_chars, epochs=30, batch_size=8)
+                        print("\nStarting model training...")
+                        history = captcha_solver.train(X_train_chars, y_train_chars, X_val_chars, y_val_chars, epochs=50, batch_size=16)
+                        if history:
+                            print("\nTraining history:")
+                            for metric, values in history.items():
+                                print(f"{metric}: {values[-1]:.4f}")
                     else:
-                        print("Training or validation set for characters is empty. Skipping training. This can occur if too few valid samples were found or due to the split of a very small dataset.")
+                        print("Training or validation set for characters is empty. Skipping training.")
 
-                    # --- 7. Evaluate on the test set ---
-                    print("\n=== Model Evaluation ===")
-                    
-                    # First evaluate character-level accuracy
-                    if len(X_test_chars) > 0 and len(y_test_chars) > 0:
-                        print("\n--- Character-Level Evaluation ---")
-                        loss, char_accuracy = captcha_solver.evaluate_model(X_test_chars, y_test_chars)
+                    # --- 7. Test the model on test samples only ---
+                    if test_samples:
+                        print("\n--- Testing Model on Test Set Only ---")
+                        correct_predictions = 0
+                        total_predictions = 0
+                        
+                        # Create a directory for test predictions if it doesn't exist
+                        test_output_dir = "test_predictions"
+                        if not os.path.exists(test_output_dir):
+                            os.makedirs(test_output_dir)
+                            
+                        # Test only on test set samples
+                        for img_path, actual_label in test_samples:
+                            base_name = os.path.splitext(os.path.basename(img_path))[0]
+                            output_path = os.path.join(test_output_dir, f"predicted_{base_name}.txt")
+                            
+                            # Make prediction
+                            predicted_text = captcha_solver(img_path, output_path)
+                            
+                            # Print results
+                            print(f"\nTesting {base_name}:")
+                            print(f"Predicted: {predicted_text}")
+                            print(f"Actual:    {actual_label}")
+                            
+                            if predicted_text == actual_label:
+                                correct_predictions += 1
+                                print("✓ Correct!")
+                            else:
+                                char_matches = sum(1 for p, a in zip(predicted_text, actual_label) if p == a)
+                                char_accuracy = char_matches / len(actual_label) if len(predicted_text) == len(actual_label) else 0
+                                print(f"✗ Incorrect (Character-level accuracy: {char_accuracy:.2%})")
+                            
+                            total_predictions += 1
+                        
+                        # Print final statistics
+                        print("\n--- Final Test Set Results ---")
+                        accuracy = correct_predictions / total_predictions
+                        print(f"Test Set Accuracy: {accuracy:.2%} ({correct_predictions}/{total_predictions} correct)")
+                        print(f"All test predictions have been saved in the '{test_output_dir}' directory")
                     else:
-                        print("Test set for characters is empty, skipping character-level evaluation.")
-                    
-                    # Now evaluate full CAPTCHA accuracy on test samples
-                    print("\n--- Full CAPTCHA Evaluation ---")
-                    test_results = []
-                    total_correct_chars = 0
-                    total_chars = 0
-                    
-                    # Get test set samples (approximately 20% of all samples)
-                    num_test_samples = max(1, len(all_samples_data) // 5)  # At least 1 test sample
-                    test_samples = all_samples_data[-num_test_samples:]  # Take last 20% as test set
-                    
-                    print(f"Testing on {len(test_samples)} full CAPTCHA images...")
-                    
-                    for test_img_path, true_label in test_samples:
-                        # Create output filename for this test sample
-                        base_name = os.path.basename(test_img_path)
-                        name_part = os.path.splitext(base_name)[0]
-                        test_output_filename = f"predicted_{name_part}.txt"
-                        
-                        # Get prediction
-                        predicted_text = captcha_solver(test_img_path, test_output_filename)
-                        
-                        # Calculate character-level accuracy for this sample
-                        correct_chars = sum(1 for p, t in zip(predicted_text, true_label) if p == t)
-                        total_correct_chars += correct_chars
-                        total_chars += len(true_label)
-                        
-                        # Store results
-                        is_correct = predicted_text == true_label
-                        test_results.append({
-                            'image': base_name,
-                            'predicted': predicted_text,
-                            'actual': true_label,
-                            'is_correct': is_correct,
-                            'correct_chars': correct_chars,
-                            'total_chars': len(true_label)
-                        })
-                        
-                        # Print individual result
-                        print(f"\nTest image: {base_name}")
-                        print(f"Predicted: {predicted_text}")
-                        print(f"Actual:    {true_label}")
-                        print(f"Correct:   {'✓' if is_correct else '✗'}")
-                        print(f"Character accuracy: {correct_chars}/{len(true_label)} ({correct_chars/len(true_label)*100:.1f}%)")
-                    
-                    # Calculate and print overall statistics
-                    num_correct = sum(1 for r in test_results if r['is_correct'])
-                    captcha_accuracy = num_correct / len(test_results) if test_results else 0
-                    char_level_accuracy = total_correct_chars / total_chars if total_chars > 0 else 0
-                    
-                    print("\n=== Final Test Results ===")
-                    print(f"Total test samples: {len(test_results)}")
-                    print(f"Fully correct CAPTCHAs: {num_correct}/{len(test_results)} ({captcha_accuracy*100:.1f}%)")
-                    print(f"Character-level accuracy: {total_correct_chars}/{total_chars} ({char_level_accuracy*100:.1f}%)")
-                    
-                    # Save test results to a file
-                    with open("test_results.txt", "w") as f:
-                        f.write("=== CAPTCHA Solver Test Results ===\n\n")
-                        f.write(f"Total test samples: {len(test_results)}\n")
-                        f.write(f"Fully correct CAPTCHAs: {num_correct}/{len(test_results)} ({captcha_accuracy*100:.1f}%)\n")
-                        f.write(f"Character-level accuracy: {total_correct_chars}/{total_chars} ({char_level_accuracy*100:.1f}%)\n\n")
-                        f.write("Detailed Results:\n")
-                        for r in test_results:
-                            f.write(f"\nImage: {r['image']}\n")
-                            f.write(f"Predicted: {r['predicted']}\n")
-                            f.write(f"Actual:    {r['actual']}\n")
-                            f.write(f"Correct:   {'Yes' if r['is_correct'] else 'No'}\n")
-                            f.write(f"Character accuracy: {r['correct_chars']}/{r['total_chars']}\n")
+                        print("No test samples available, skipping testing.")
