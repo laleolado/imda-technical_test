@@ -1,0 +1,8 @@
+name: imda_ta
+channels:
+  - anaconda
+  - defaults
+dependencies:
+  - python=3.9
+  - pillow>=9.0.0
+  - numpy>=1.20.0 
