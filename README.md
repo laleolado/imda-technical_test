@@ -1,6 +1,27 @@
 # imda-technical_test
 for ai scientist role 2025
 
+## Table of Contents
+- [Captcha Solver](#captcha-solver)
+- [How it Works: Overall Flow](#how-it-works-overall-flow)
+- [Detailed Code Explanation (`captcha_solver.py`)](#detailed-code-explanation-captcha_solverpy)
+  - [`Captcha` Class](#captcha-class)
+    - [`__init__(self)`](#__init__self)
+    - [`train(self, training_samples=None, sample_captcha_dir=None, sample_labels_dir=None)`](#trainself-training_samplesnone-sample_captcha_dirnone-sample_labels_dirnone)
+    - [`__call__(self, im_path, save_path)`](#__call__self-im_path-save_path)
+    - [`_preprocess_image(self, im_path)`](#_preprocess_imageself-im_path)
+    - [`_segment_characters(self, binary_image_np, num_chars=5)`](#_segment_charactersself-binary_image_np-num_chars5)
+    - [`_train(self)`](#_trainself)
+    - [`_match_character(self, char_np_segment)`](#_match_characterself-char_np_segment)
+  - [`if __name__ == '__main__':` Block](#if-__name__--__main__-block)
+- [Solving New (Unseen) Captchas](#solving-new-unseen-captchas)
+- [Setup and Dependencies](#setup-and-dependencies)
+- [Directory Structure](#directory-structure)
+- [Running the Code](#running-the-code)
+  - [Example Output](#example-output)
+- [Assumptions and Limitations](#assumptions-and-limitations)
+- [Rationale for Template Matching Approach](#rationale-for-template-matching-approach)
+
 # Captcha Solver
 
 This project implements a Python-based Captcha solver using a **pattern matching approach** to identify characters in 5-character image captchas. The core methodology involves:
@@ -134,7 +155,22 @@ The solver operates in several stages when `captcha_solver.py` is executed:
     2.  **Normalize Input Segment**: Input `char_np_segment` (from inference image) undergoes *same normalization* as training segments (resized to `self.char_height`, padded/cropped to `self.char_width`) -> `processed_segment`.
     3.  **Compare with Stored Maps**: 
         *   Iterates `char_label`, `char_map_template` in `self.char_maps`.
-        *   **Calculate Difference**: `np.sum(np.abs(processed_segment - char_map_template))` (Hamming distance for binary arrays).
+        *   **Calculate Difference**: `np.sum(np.abs(processed_segment - char_map_template))` (Hamming distance for binary arrays). This is where Hamming distance is applied.
+            *   **Hamming Distance**: For two binary strings (or in this case, flattened binary 2D arrays representing character images) of equal length, the Hamming distance is the number of positions at which the corresponding symbols (pixels) are different.
+            *   **Mathematical Representation**:
+                If we have two binary character maps (let's call them `Map_A` and `Map_B`), both flattened into sequences of 0s and 1s of the same length (say, `n` pixels):
+                  `Map_A = [A_1, A_2, ..., A_n]`
+                  `Map_B = [B_1, B_2, ..., B_n]`
+                The Hamming Distance between `Map_A` and `Map_B` is calculated by comparing them pixel by pixel. For each position `i` from 1 to `n`:
+                  - If the pixel `A_i` is different from pixel `B_i`, we count it as 1.
+                  - If the pixel `A_i` is the same as pixel `B_i`, we count it as 0.
+                The total Hamming Distance is the sum of these counts.
+                Essentially, it's the total number of pixels that differ between the two binary maps.
+                In terms of operations, for each position `i`:
+                  `Difference_at_i = 1` if `A_i` is not equal to `B_i`
+                  `Difference_at_i = 0` if `A_i` is equal to `B_i`
+                Then, the Hamming Distance is: `Sum(Difference_at_1 + Difference_at_2 + ... + Difference_at_n)`.
+                In this project's implementation with NumPy, `np.abs(processed_segment - char_map_template)` calculates the element-wise difference (0 if same, 1 if different, since they are binary 0/1 arrays), and `np.sum(...)` then counts these differences, effectively calculating the Hamming distance.
         *   **Find Best Match**: Tracks `char_label` with `min_diff`.
     4.  **Return**: `best_match_char`.
 
