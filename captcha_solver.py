@@ -5,12 +5,15 @@ import numpy as np
 import random
 import shutil # For managing directories if needed
 
+# Define a directory for debug images
+DEBUG_IMAGE_DIR = "debug_intermediate_images"
+
 class Captcha(object):
     def __init__(self, training_samples=None, sample_captcha_dir="sampleCaptchas/input", sample_labels_dir="sampleCaptchas/output"):
         self.char_maps = {}
         self.char_height = 0
         self.char_width = 0
-        self.threshold = (50, 50, 50) # Default RGB threshold
+        self.threshold = (50, 50, 50) # Default RGB threshold - Reverted to (50,50,50)
         
         # Store training samples if provided directly
         self.training_samples = training_samples 
@@ -18,6 +21,10 @@ class Captcha(object):
         # Keep these for compatibility if training_samples is None (original behavior)
         self.sample_captcha_dir = sample_captcha_dir
         self.sample_labels_dir = sample_labels_dir
+
+        # Create debug directory if it doesn't exist
+        if not os.path.exists(DEBUG_IMAGE_DIR):
+            os.makedirs(DEBUG_IMAGE_DIR, exist_ok=True)
 
         self._train()
 
@@ -34,13 +41,25 @@ class Captcha(object):
         img_np = np.array(img)
         r, g, b = img_np[:,:,0], img_np[:,:,1], img_np[:,:,2]
         
-        mask = (r <= self.threshold[0]) & (g <= self.threshold[1]) & (b <= self.threshold[2])
+        # Changed from AND to OR logic based on problem description interpretation:
+        # "pixels lighter than (50,50,50) may be re-painted to white - and all other pixels may be marked as black"
+        # This means IF NOT (R > 50 AND G > 50 AND B > 50), THEN pixel is BLACK (character).
+        # Which is equivalent to (R <= 50 OR G <= 50 OR B <= 50).
+        mask = (r <= self.threshold[0]) | (g <= self.threshold[1]) | (b <= self.threshold[2])
         
         binary_image_np = np.zeros(mask.shape, dtype=np.uint8)
         binary_image_np[mask] = 1
         
         # Create a PIL Image from the binary numpy array for resizing
         binary_pil_img = Image.fromarray(binary_image_np * 255, 'L') # L mode for grayscale
+
+        # Save preprocessed image for debugging
+        try:
+            original_filename = os.path.basename(im_path)
+            debug_save_path = os.path.join(DEBUG_IMAGE_DIR, f"preprocessed_{os.path.splitext(original_filename)[0]}.png")
+            binary_pil_img.save(debug_save_path)
+        except Exception as e_save:
+            print(f"Warning: Could not save debug preprocessed image {debug_save_path}: {e_save}")
 
         return binary_pil_img, binary_image_np
 
@@ -77,32 +96,47 @@ class Captcha(object):
         if cropped_captcha_np.shape[0] == 0 or cropped_captcha_np.shape[1] == 0: # if width or height is zero after crop
             return []
 
-        # Character Slot Segmentation
-        content_width = cropped_captcha_np.shape[1]
-        char_slot_width = content_width / num_chars
-        
+        # --- New Valley-Seeking Segmentation Logic ---
+        content_height, content_width = cropped_captcha_np.shape
+        col_sums = np.sum(cropped_captcha_np, axis=0) # Vertical projection
+
         extracted_chars_np = []
+        current_x = 0
+        approx_char_width = content_width / num_chars
+
         for i in range(num_chars):
-            start_x = int(i * char_slot_width)
-            end_x = int((i + 1) * char_slot_width)
-            # Ensure end_x does not exceed cropped_captcha_np width
-            end_x = min(end_x, cropped_captcha_np.shape[1])
-            # Ensure start_x is not greater than or equal to end_x, especially for the last character
-            if start_x >= end_x :
-                if extracted_chars_np and i == num_chars -1: # If it's the last char and others exist
-                    # try to take a small slice from the end if possible
-                    start_x = max(0, cropped_captcha_np.shape[1] - int(char_slot_width/2) if char_slot_width > 1 else cropped_captcha_np.shape[1]-1)
-                    end_x = cropped_captcha_np.shape[1]
-                    if start_x >= end_x : # Still bad, append empty
-                         extracted_chars_np.append(np.array([]))
-                         continue
-                else: # Otherwise problem with slotting
-                    extracted_chars_np.append(np.array([]))
-                    continue
+            if current_x >= content_width:
+                extracted_chars_np.append(np.array([]))
+                continue
 
+            if i < num_chars - 1: # For the first num_chars-1 characters, find a split point
+                # Define search window for the valley (end of current character)
+                search_start_x = int(current_x + approx_char_width * 0.5) # Start searching a bit into the char
+                search_end_x = int(current_x + approx_char_width * 1.5)   # Search up to 1.5x the approx width
+                
+                search_start_x = max(current_x + 1, search_start_x) # Ensure search is after current_x
+                search_start_x = min(search_start_x, content_width -1)
+                search_end_x = min(search_end_x, content_width -1)
+                
+                if search_start_x >= search_end_x: # If search window is invalid or too small
+                    # Fallback to approximate width for this split if window is bad
+                    split_x = min(content_width, int(current_x + approx_char_width))
+                else:
+                    # Find the valley (column with min_sum) in the search window
+                    # Add a small penalty to sums of zero to prefer actual valleys over large empty spaces if any.
+                    # However, for binary images, this might not be necessary. Let's try direct min first.
+                    if len(col_sums[search_start_x:search_end_x+1]) > 0:
+                        valley_index_in_window = np.argmin(col_sums[search_start_x:search_end_x+1])
+                        split_x = search_start_x + valley_index_in_window
+                    else: # search window was empty for some reason (e.g. content_width is very small)
+                        split_x = min(content_width, int(current_x + approx_char_width))
+            else: # For the last character, take the rest of the image
+                split_x = content_width
 
-            char_segment_np = cropped_captcha_np[:, start_x:end_x]
+            char_segment_np = cropped_captcha_np[:, current_x:split_x]
+            current_x = split_x # Move to the next character's start
 
+            # --- Existing tight cropping logic for the found segment --- 
             if char_segment_np.size == 0 or np.sum(char_segment_np) == 0: # Empty segment
                 extracted_chars_np.append(np.array([])) 
                 continue
@@ -133,6 +167,12 @@ class Captcha(object):
                      extracted_chars_np.append(np.array([]))
                 else:
                     extracted_chars_np.append(tight_char_np)
+                    # Save raw segmented character for debugging
+                    # Note: This assumes binary_image_np came from an image with a known filename,
+                    # which is true during training and __call__. We need the original filename.
+                    # This part is tricky as _segment_characters doesn't directly receive im_path.
+                    # We'll add saving in the __call__ method after segmentation for test images,
+                    # and in _train for training images.
         
         return extracted_chars_np
 
@@ -206,6 +246,8 @@ class Captcha(object):
             offset = (current_w - self.char_width) // 2
             final_map[:, :] = resized_char_np[:, offset:offset+self.char_width]
             
+        # No direct im_path here, saving of normalized segments will be handled 
+        # in _match_character where im_path context might be passed or inferred.
         return final_map
 
     def _train(self):
@@ -288,6 +330,24 @@ class Captcha(object):
             # else:
                 # print(f"Warning: Did not segment 5 chars from {im_path} (got {len(char_segments_np)}). Label: {label_text}.")
 
+        # Save segmented characters from training data
+        for item_idx, item in enumerate(training_data_to_process):
+            im_path = item['path']
+            original_filename_base = os.path.splitext(os.path.basename(im_path))[0]
+            # Re-process to get segments specifically for saving this one image's segments if they were good
+            _, temp_binary_image_np = self._preprocess_image(im_path)
+            if temp_binary_image_np is not None:
+                temp_char_segments_for_saving = self._segment_characters(temp_binary_image_np)
+                if len(temp_char_segments_for_saving) == 5: # Only save if segmentation was successful for this image
+                    for i, seg_np in enumerate(temp_char_segments_for_saving):
+                        if seg_np is not None and seg_np.size > 0:
+                            try:
+                                seg_img = Image.fromarray(seg_np.astype(np.uint8) * 255, 'L')
+                                debug_seg_path = os.path.join(DEBUG_IMAGE_DIR, f"segmented_TRAIN_{original_filename_base}_char_{i}.png")
+                                seg_img.save(debug_seg_path)
+                            except Exception as e_save_seg:
+                                print(f"Warning: Could not save debug TRAIN segmented char {debug_seg_path}: {e_save_seg}")
+
 
         if not all_char_dims:
             print("Warning: No characters were successfully segmented from any training samples. Character maps cannot be built effectively.")
@@ -316,15 +376,59 @@ class Captcha(object):
         # Create Character Maps
         for char_label, segments_list in temp_char_segments.items():
             if segments_list:
-                # For simplicity, take the first segment. Could be averaged or median image.
-                # To be more robust, one might average or take a median *normalized* segment
+                if len(segments_list) > 1:
+                    print(f"Info: Found {len(segments_list)} segments for training char '{char_label}'. Saving all normalized candidates to debug folder.")
+
+                best_segment_for_template = None # Placeholder for the segment we'll actually use
+
+                for idx, segment_raw_candidate in enumerate(segments_list):
+                    # We need to find the original image path that this segment_raw_candidate came from
+                    # This is a bit tricky because temp_char_segments only stores the numpy arrays.
+                    # We need to re-iterate through training_data_to_process to find its source for naming.
+                    # This is inefficient but necessary for good debug filenames.
+                    original_filename_for_candidate = "unknown_source"
+                    char_index_in_source = -1
+                    
+                    # Attempt to find which original training sample this segment belongs to
+                    # This loop is for naming and is not the most efficient
+                    found_source = False
+                    for train_item_info in training_data_to_process:
+                        if found_source: break
+                        # Re-segment this training_item_info to see if segment_raw_candidate matches one of its segments
+                        # This check is by object identity, which should work if it's the same numpy array instance
+                        # However, if segments were copied, this might fail. A content check (np.array_equal) is safer but slower.
+                        # Let's assume for now that segments_list contains direct references from the initial segmentation pass.
+                        # A more robust way would be to store (segment_np, original_im_path, original_char_idx) in temp_char_segments.
+                        # For now, we'll use a simpler naming if source is hard to trace back.
+                        
+                        # Simplified: we don't have the direct link here easily for *each* segment in segments_list
+                        # So, we will save candidates as template_candidate_CHAR_idx.png
+                        # The user would then look at all segmented_TRAIN images to find the best source visually.
+                        
+                    final_map_candidate = self._normalize_segment_for_map(segment_raw_candidate)
+                    
+                    # Save this candidate
+                    try:
+                        map_img = Image.fromarray(final_map_candidate.astype(np.uint8) * 255, 'L')
+                        # Better naming would require knowing the source image of segment_raw_candidate
+                        debug_candidate_path = os.path.join(DEBUG_IMAGE_DIR, f"template_candidate_{char_label}_sourceidx_{idx}.png")
+                        map_img.save(debug_candidate_path)
+                    except Exception as e_save_candidate:
+                        print(f"Warning: Could not save debug template candidate {debug_candidate_path}: {e_save_candidate}")
+
+                    if idx == 0: # Use the first one as the default template for now
+                        best_segment_for_template = final_map_candidate
                 
-                # Let's try to find the "best" segment (e.g. largest area, or median size)
-                # For now, still using the first one encountered for simplicity of the original logic.
-                best_segment_raw = segments_list[0] 
-                
-                final_map = self._normalize_segment_for_map(best_segment_raw)
-                self.char_maps[char_label] = final_map
+                if best_segment_for_template is not None:
+                    self.char_maps[char_label] = best_segment_for_template
+                    # Save the chosen one with the standard name for clarity, this might overwrite a previous one if multiple chars
+                    try:
+                        map_img = Image.fromarray(best_segment_for_template.astype(np.uint8) * 255, 'L')
+                        debug_map_path = os.path.join(DEBUG_IMAGE_DIR, f"template_{char_label}.png") # This is the active template
+                        map_img.save(debug_map_path)
+                    except Exception as e_save_map:
+                        print(f"Warning: Could not save debug template map {debug_map_path}: {e_save_map}")
+                # else: best_segment_for_template will be None if segments_list was empty, already handled by outer if
         
         if self.char_maps:
             print(f"Training complete. {len(self.char_maps)} character maps created: {''.join(sorted(self.char_maps.keys()))}")
@@ -349,6 +453,10 @@ class Captcha(object):
         min_diff = float('inf')
         best_match_char = "?"
 
+        # --- Add this block for detailed diff logging ---
+        scores = {}
+        # --- End of added block ---
+
         if np.sum(processed_segment) == 0 and not (self.char_height == 0 or self.char_width == 0) : # if normalized segment is blank
             # print("Debug: Normalized segment is blank, likely won't match anything well.")
             # it will naturally have high diff with non-blank templates
@@ -366,6 +474,10 @@ class Captcha(object):
             diff = np.sum(np.abs(processed_segment - char_map_template))
             # print(f"  Diff with '{char_label}': {diff}")
 
+            # --- Add this line for detailed diff logging ---
+            scores[char_label] = diff
+            # --- End of added line ---
+
             if diff < min_diff:
                 min_diff = diff
                 best_match_char = char_label
@@ -373,6 +485,29 @@ class Captcha(object):
             # For example, if min_diff is still very high, could return "?"
         
         # print(f"Debug: Best match for segment: '{best_match_char}' with diff {min_diff}")
+
+        # --- Add this block for detailed diff logging ---
+        # This check helps to only print scores for problematic images if you can pass a context/flag
+        # For now, let's print if best_match_char is one of the known problematic ones, 
+        # or if the true character (if known here) would be misclassified.
+        # Since we don't have true_label directly here, we'll rely on inspecting output for now.
+        # To make it more targeted, you could pass the im_path to _match_character
+        # and check if it's input00.jpg or input20.jpg
+        
+        # Simple approach: Print all scores for every match for now, can be filtered later
+        # sorted_scores = sorted(scores.items(), key=lambda item: item[1])
+        # print(f"Debug: Matching scores for current segment (best '{best_match_char}' with {min_diff}): {sorted_scores[:5]} ... {sorted_scores[-5:]}")
+        # Let's print all scores if the best_match_char is part of the known misclassifications or their correct counterparts
+        # This is a heuristic. A better way would be to pass original_filename_base_call to this function.
+        # For now, let's print all scores to see the comparison.
+        if True: # Temporarily print all scores for all chars to help debug
+            print(f"--- Scores for segment that matched to: {best_match_char} (diff: {min_diff}) ---")
+            sorted_scores = sorted(scores.items(), key=lambda item: item[1])
+            for char, score in sorted_scores:
+                print(f"    {char}: {score}")
+            print("-----------------------------------------------------")
+        # --- End of added block ---
+
         return best_match_char
 
     def __call__(self, im_path, save_path):
@@ -406,6 +541,17 @@ class Captcha(object):
 
         char_segments_np = self._segment_characters(binary_image_np)
         
+        # Save segmented characters for the current inference image
+        original_filename_base_call = os.path.splitext(os.path.basename(im_path))[0]
+        for i, seg_np in enumerate(char_segments_np):
+            if seg_np is not None and seg_np.size > 0:
+                try:
+                    seg_img = Image.fromarray(seg_np.astype(np.uint8) * 255, 'L')
+                    debug_seg_path = os.path.join(DEBUG_IMAGE_DIR, f"segmented_INFER_{original_filename_base_call}_char_{i}.png")
+                    seg_img.save(debug_seg_path)
+                except Exception as e_save_seg:
+                    print(f"Warning: Could not save debug INFER segmented char {debug_seg_path}: {e_save_seg}")
+        
         result_text = ""
         num_segments = len(char_segments_np)
 
@@ -415,17 +561,33 @@ class Captcha(object):
             if num_segments == 0: 
                  result_text = "?????"
             elif num_segments < 5:
-                for segment_np in char_segments_np:
+                for char_idx, segment_np in enumerate(char_segments_np): # Added char_idx for normalized saving
                     if segment_np is not None and segment_np.size > 0:
-                        result_text += self._match_character(segment_np)
+                        # Save normalized segment before matching
+                        normalized_for_match = self._normalize_segment_for_map(segment_np)
+                        try:
+                            norm_img = Image.fromarray(normalized_for_match.astype(np.uint8) * 255, 'L')
+                            debug_norm_path = os.path.join(DEBUG_IMAGE_DIR, f"normalized_INFER_{original_filename_base_call}_char_{char_idx}.png")
+                            norm_img.save(debug_norm_path)
+                        except Exception as e_save_norm:
+                            print(f"Warning: Could not save debug INFER normalized char {debug_norm_path}: {e_save_norm}")
+                        result_text += self._match_character(segment_np) # Pass original segment_np to match
                     else:
                         result_text += "?" # Placeholder for empty/failed segment
                 result_text += "?" * (5 - len(result_text)) # Pad to 5 chars
             else: # num_segments > 5
                 count = 0
-                for segment_np in char_segments_np:
+                for char_idx, segment_np in enumerate(char_segments_np): # Added char_idx
                     if count >= 5: break
                     if segment_np is not None and segment_np.size > 0:
+                        # Save normalized segment before matching
+                        normalized_for_match = self._normalize_segment_for_map(segment_np)
+                        try:
+                            norm_img = Image.fromarray(normalized_for_match.astype(np.uint8) * 255, 'L')
+                            debug_norm_path = os.path.join(DEBUG_IMAGE_DIR, f"normalized_INFER_{original_filename_base_call}_char_{char_idx}.png")
+                            norm_img.save(debug_norm_path)
+                        except Exception as e_save_norm:
+                            print(f"Warning: Could not save debug INFER normalized char {debug_norm_path}: {e_save_norm}")
                         result_text += self._match_character(segment_np)
                         count +=1
                     else: # if a segment is bad, still count it as a slot attempt
@@ -437,8 +599,16 @@ class Captcha(object):
 
 
         else: # Exactly 5 segments
-            for segment_np in char_segments_np:
+            for char_idx, segment_np in enumerate(char_segments_np): # Added char_idx
                 if segment_np is not None and segment_np.size > 0:
+                    # Save normalized segment before matching
+                    normalized_for_match = self._normalize_segment_for_map(segment_np)
+                    try:
+                        norm_img = Image.fromarray(normalized_for_match.astype(np.uint8) * 255, 'L')
+                        debug_norm_path = os.path.join(DEBUG_IMAGE_DIR, f"normalized_INFER_{original_filename_base_call}_char_{char_idx}.png")
+                        norm_img.save(debug_norm_path)
+                    except Exception as e_save_norm:
+                        print(f"Warning: Could not save debug INFER normalized char {debug_norm_path}: {e_save_norm}")
                     result_text += self._match_character(segment_np)
                 else:
                     result_text += "?" # Placeholder for empty/failed segment
@@ -471,8 +641,13 @@ if __name__ == '__main__':
             print(f"Error: Could not create inference output directory {inference_output_dir}: {e}. Exiting.")
             exit()
 
+    # Clear and recreate the debug image directory at the start of the script
+    if os.path.exists(DEBUG_IMAGE_DIR):
+        shutil.rmtree(DEBUG_IMAGE_DIR)
+    os.makedirs(DEBUG_IMAGE_DIR, exist_ok=True)
+
     # 1. Collect all available samples (image path, label string)
-    all_samples = []
+    all_samples = [] # Initialize all_samples list here
     print(f"Loading samples from {sample_input_dir} and labels from {sample_labels_dir}...")
     
     # Look for .jpg, .jpeg, .png files (case-insensitive for extensions)
