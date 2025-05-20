@@ -7,10 +7,11 @@ for ai scientist role 2025
 - [Detailed Code Explanation (`captcha_solver.py`)](#detailed-code-explanation-captcha_solverpy)
   - [`Captcha` Class](#captcha-class)
     - [`__init__(self)`](#__init__self)
-    - [`train(self, training_samples=None, sample_captcha_dir=None, sample_labels_dir=None)`](#trainself-training_samplesnone-sample_captcha_dirnone-sample_labels_dirnone)
     - [`__call__(self, im_path, save_path)`](#__call__self-im_path-save_path)
+    - [`train(self, training_samples=None, sample_captcha_dir=None, sample_labels_dir=None)`](#trainself-training_samplesnone-sample_captcha_dirnone-sample_labels_dirnone)
     - [`_preprocess_image(self, im_path)`](#_preprocess_imageself-im_path)
     - [`_segment_characters(self, binary_image_np, num_chars=5)`](#_segment_charactersself-binary_image_np-num_chars5)
+    - [`_normalize_segment_for_map(self, segment_np)`](#_normalize_segment_for_mapself-segment_np)
     - [`_train(self)`](#_trainself)
     - [`_match_character(self, char_np_segment)`](#_match_characterself-char_np_segment)
   - [`if __name__ == '__main__':` Block](#if-__name__--__main__-block)
@@ -78,13 +79,6 @@ The solver operates in several stages when `captcha_solver.py` is executed:
     *   `self.sample_labels_dir`: Default "sampleCaptchas/output". Used by `_train` if `training_samples` not provided.
     *   **Note**: Sets initial parameters. `train()` must be called explicitly to train.
 
-*   **`train(self, training_samples=None, sample_captcha_dir=None, sample_labels_dir=None)`**
-    *   Orchestrates training by calling internal `_train()`.
-    *   `training_samples` (optional): List of `(image_path, label_text)` tuples. If provided, these specific samples used for training, overriding directory scanning.
-    *   `sample_captcha_dir` (optional): Path to training CAPTCHA image directory. Updates `self.sample_captcha_dir`. Used by `_train` if `training_samples` not provided.
-    *   `sample_labels_dir` (optional): Path to training label file directory. Updates `self.sample_labels_dir`. Used by `_train` if `training_samples` not provided.
-    *   Actual training logic (segmentation, normalization, map creation) in `_train()`.
-
 *   **`__call__(self, im_path, save_path)`**
     1.  **Check Training**: If model not trained (`self.char_maps` empty), writes error to `save_path`, returns error string.
     2.  **Preprocess**: Calls `_preprocess_image` on `im_path`. If fails, error written, error string returned.
@@ -94,6 +88,14 @@ The solver operates in several stages when `captcha_solver.py` is executed:
     5.  **Match Characters**: If 5 segments found/adjusted, iterates, calls `_match_character` for each, concatenates results to `result_text`.
     6.  **Save Result**: Writes `result_text` to `save_path`. Ensures output directory exists.
     7.  **Return Value**: Returns inferred `result_text` string.
+
+*   **`train(self, training_samples=None, sample_captcha_dir=None, sample_labels_dir=None)`**
+    *   Orchestrates training by calling internal `_train()`.
+    *   `training_samples` (optional): List of `(image_path, label_text)` tuples. If provided, these specific samples used for training, overriding directory scanning.
+    *   `sample_captcha_dir` (optional): Path to training CAPTCHA image directory. Updates `self.sample_captcha_dir`. Used by `_train` if `training_samples` not provided.
+    *   `sample_labels_dir` (optional): Path to training label file directory. Updates `self.sample_labels_dir`. Used by `_train` if `training_samples` not provided.
+    *   Actual training logic (segmentation, normalization, map creation) in `_train()`.
+    *   **Note on `train` vs. `_train`**: The public `train()` method serves as the primary user interface for initiating the training process. It handles optional arguments for specifying training data sources (e.g., a list of samples or directory paths) and configures the solver instance accordingly. It then calls the internal `_train()` method (indicated by the leading underscore, a convention for internal use methods in Python). The `_train()` method contains the detailed, step-by-step logic for processing the training data: iterating through images and labels, preprocessing, segmenting characters, determining standard dimensions for normalization, and finally building the character maps. This separation keeps the public API (`train()`) clean and user-focused, while encapsulating the more complex core training routines within `_train()` for better organization.
 
 *   **`_preprocess_image(self, im_path)`**
     1.  **Load Image**: Opens image (Pillow), converts to RGB. Handles file not found/corrupt image by returning `(None, None)` (skipped in training, error in inference via `__call__`).
@@ -128,6 +130,17 @@ The solver operates in several stages when `captcha_solver.py` is executed:
             *   Else, tight crop by finding its specific non-empty rows/columns. Isolates character precisely.
             *   Appends final tightly cropped 2D NumPy array to `extracted_chars_np`.
     4.  **Return**: `extracted_chars_np` (list of 2D NumPy arrays for segmented characters). May contain empty arrays `[]`.
+
+*   **`_normalize_segment_for_map(self, segment_np)`**
+    *   Normalizes an individual character segment to a standard size (`self.char_height`, `self.char_width`), crucial for consistent template matching.
+    *   **Process**:
+        1.  Handles empty or invalid input segments by returning a zero array of target dimensions.
+        2.  Resizes the segment to `self.char_height` while maintaining aspect ratio. The new width is calculated proportionally.
+        3.  Creates a blank canvas (NumPy array of zeros) of dimensions `self.char_height` x `self.char_width`.
+        4.  Centers the resized segment onto this canvas:
+            *   If the resized segment is narrower than `self.char_width`, it's centered with padding on either side.
+            *   If the resized segment is wider than `self.char_width`, it's centered and then cropped to fit `self.char_width`.
+    *   **Return**: A NumPy array of shape (`self.char_height`, `self.char_width`) representing the normalized binary character map. Returns a zero array if input is invalid or `self.char_height`/`self.char_width` are not set.
 
 *   **`_train(self)`**
     1.  **Determine Training Data**:
